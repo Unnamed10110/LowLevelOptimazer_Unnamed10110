@@ -10,7 +10,9 @@
  * - Flush DNS cache
  * - Restart Windows Explorer (fixes sluggish desktop/taskbar)
  * - Optimize screen/display (flush graphics, redraw desktop, restart DWM when lagging)
- * - Trim working sets of background processes
+ * - Flush modified memory list, purge low-priority standby (low-level NT memory)
+ * - Flush filesystem cache (volume C:), clear clipboard
+ * - Trim working sets of background processes, boost process priority
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -26,6 +28,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,14 +91,15 @@ static void AppendResult(const WCHAR* text) {
     }
 }
 
-/* Empty the Windows Standby Memory List - frees cached RAM */
+/* Empty the Windows Standby Memory List - frees cached RAM, flush modified pages */
 static int EmptyStandbyList(void) {
     HANDLE hProcess = GetCurrentProcess();
     HANDLE hToken = NULL;
     HMODULE hNtdll;
     pNtSetSystemInformation NtSetSystemInformation = NULL;
     NTSTATUS status;
-    SYSTEM_MEMORY_LIST_COMMAND command = MemoryPurgeStandbyList;
+    SYSTEM_MEMORY_LIST_COMMAND cmd;
+    int anyOk = 0;
 
     if (!OpenProcessToken(hProcess, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken)) {
         fprintf(stderr, "[!] Cannot open process token (run as Administrator)\n");
@@ -122,21 +126,43 @@ static int EmptyStandbyList(void) {
         return -1;
     }
 
-    status = NtSetSystemInformation(SystemMemoryListInformation, &command, sizeof(command));
-    FreeLibrary(hNtdll);
+    /* Purge low-priority standby first (less aggressive) */
+    cmd = MemoryPurgeLowPriorityStandbyList;
+    status = NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(cmd));
+    if (NT_SUCCESS(status)) {
+        printf("[+] Low-priority standby purged\n");
+        AppendResult(L"• Low-priority standby purged");
+        anyOk = 1;
+    } else if (status != STATUS_PRIVILEGE_NOT_HELD) {
+        fprintf(stderr, "[!] Purge low-priority standby failed: 0x%08lX\n", (unsigned long)status);
+    }
 
-    if (status == STATUS_PRIVILEGE_NOT_HELD) {
+    /* Flush modified (dirty) pages to disk */
+    cmd = MemoryFlushModifiedList;
+    status = NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(cmd));
+    if (NT_SUCCESS(status)) {
+        printf("[+] Modified memory list flushed to disk\n");
+        AppendResult(L"• Modified list flushed to disk");
+        anyOk = 1;
+    } else if (status != STATUS_PRIVILEGE_NOT_HELD) {
+        fprintf(stderr, "[!] Flush modified list failed: 0x%08lX\n", (unsigned long)status);
+    }
+
+    /* Full standby list purge */
+    cmd = MemoryPurgeStandbyList;
+    status = NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(cmd));
+    if (NT_SUCCESS(status)) {
+        printf("[+] Standby memory list emptied - RAM freed\n");
+        AppendResult(L"• Standby memory emptied - RAM freed");
+        anyOk = 1;
+    } else if (status == STATUS_PRIVILEGE_NOT_HELD) {
         fprintf(stderr, "[!] Insufficient privileges - run as Administrator\n");
-        return -1;
-    }
-    if (!NT_SUCCESS(status)) {
-        fprintf(stderr, "[!] NtSetSystemInformation failed: 0x%08lX\n", (unsigned long)status);
-        return -1;
+    } else {
+        fprintf(stderr, "[!] Purge standby list failed: 0x%08lX\n", (unsigned long)status);
     }
 
-    printf("[+] Standby memory list emptied - RAM freed\n");
-    AppendResult(L"• Standby memory emptied - RAM freed");
-    return 0;
+    FreeLibrary(hNtdll);
+    return anyOk ? 0 : -1;
 }
 
 /* Delete all files in a directory (non-recursive) */
@@ -392,6 +418,85 @@ static int OptimizeScreen(BOOL doDwmRestart) {
     return didSomething ? 0 : -1;
 }
 
+/* Clear clipboard - frees memory, minor optimization */
+static void ClearClipboard(void) {
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        CloseClipboard();
+        printf("[+] Clipboard cleared\n");
+        AppendResult(L"• Clipboard cleared");
+    }
+}
+
+/* Flush filesystem cache - writes buffered data to disk (needs Admin) */
+static int FlushSystemVolume(void) {
+    HANDLE hVol = CreateFileW(L"\\\\.\\C:", GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hVol == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[!] Cannot open volume C: (run as Administrator)\n");
+        return -1;
+    }
+    if (FlushFileBuffers(hVol)) {
+        printf("[+] Filesystem cache flushed (volume C:)\n");
+        AppendResult(L"• Filesystem cache flushed");
+        CloseHandle(hVol);
+        return 0;
+    }
+    CloseHandle(hVol);
+    fprintf(stderr, "[!] FlushFileBuffers failed\n");
+    return -1;
+}
+
+/* Trim working sets of background processes - frees RAM from idle processes (needs Admin) */
+static int TrimBackgroundProcesses(void) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    HANDLE hProc;
+    PROCESSENTRY32W pe = { 0 };
+    int trimmed = 0;
+    static const WCHAR* skipList[] = {
+        L"System", L"Registry", L"smss.exe", L"csrss.exe", L"wininit.exe",
+        L"services.exe", L"lsass.exe", L"svchost.exe", L"winlogon.exe",
+        L"dwm.exe", L"explorer.exe", NULL
+    };
+
+    if (hSnap == INVALID_HANDLE_VALUE) return -1;
+
+    pe.dwSize = sizeof(pe);
+    if (!Process32FirstW(hSnap, &pe)) {
+        CloseHandle(hSnap);
+        return -1;
+    }
+
+    do {
+        int skip = 0;
+        for (int s = 0; skipList[s]; s++) {
+            if (_wcsicmp(pe.szExeFile, skipList[s]) == 0) {
+                skip = 1;
+                break;
+            }
+        }
+        if (skip || pe.th32ProcessID == GetCurrentProcessId()) continue;
+
+        hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION, FALSE, pe.th32ProcessID);
+        if (hProc) {
+            if (EmptyWorkingSet(hProc)) {
+                trimmed++;
+            }
+            CloseHandle(hProc);
+        }
+    } while (Process32NextW(hSnap, &pe));
+
+    CloseHandle(hSnap);
+    if (trimmed > 0) {
+        printf("[+] Trimmed working sets of %d background processes\n", trimmed);
+        WCHAR buf[64];
+        swprintf(buf, 64, L"• Trimmed %d background process working sets", trimmed);
+        AppendResult(buf);
+        return 0;
+    }
+    return -1;
+}
+
 /* Trim working set of current process - minor optimization */
 static void TrimWorkingSet(void) {
     if (SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1)) {
@@ -464,6 +569,14 @@ int main(int argc, char* argv[]) {
 
     g_resultBuf[0] = L'\0';
 
+    /* Boost process priority so optimizations complete faster */
+    {
+        DWORD oldPri = GetPriorityClass(GetCurrentProcess());
+        if (SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+            printf("[+] Process priority boosted\n");
+            AppendResult(L"• Process priority boosted");
+        }
+
     if (doMemory) EmptyStandbyList();
     if (doTemp) ClearTempFiles();
     if (doRecycle) EmptyRecycleBin();
@@ -471,7 +584,15 @@ int main(int argc, char* argv[]) {
     if (doExplorer) RestartExplorer();
     if (doScreen) OptimizeScreen(doDwmRestart);
 
+    ClearClipboard();
+    FlushSystemVolume();
+    TrimBackgroundProcesses();
     TrimWorkingSet();
+
+    /* Restore process priority */
+    if (oldPri != 0)
+        SetPriorityClass(GetCurrentProcess(), oldPri);
+    }
 
     printf("\n[+] Optimization complete.\n");
 

@@ -12,13 +12,18 @@ A C program that restores Windows 10 responsiveness when the system becomes slow
 | **Flush DNS Cache** | Clears stale DNS entries | No |
 | **Restart Explorer** | Fixes sluggish taskbar/desktop | Yes |
 | **Optimize Screen** | Flush graphics, redraw desktop, restart DWM (fixes display lag) | DWM restart: Yes |
+| **Low-level memory** | Purge low-priority standby, flush modified list to disk | Yes |
+| **Filesystem flush** | Flush volume C: buffers to disk | Yes |
+| **Clipboard** | Clear clipboard | No |
+| **Trim background** | Empty working sets of non-critical processes | Yes |
+| **Process priority** | Boost optimizer process priority | No |
 | **Trim Working Set** | Reduces process memory footprint | No |
 
 ## Building
 
 ### Option 1: MinGW (gcc)
 ```bash
-gcc -Wall -O2 -o win_optimizer.exe win_optimizer.c -lshell32 -ladvapi32 -lgdi32
+gcc -Wall -O2 -o win_optimizer.exe win_optimizer.c -lshell32 -ladvapi32 -lgdi32 -lpsapi
 ```
 
 ### Option 2: Visual Studio (cl)

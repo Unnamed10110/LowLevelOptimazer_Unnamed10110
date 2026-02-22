@@ -3,7 +3,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
-LDFLAGS = -lshell32 -ladvapi32 -lgdi32
+LDFLAGS = -lshell32 -ladvapi32 -lgdi32 -lpsapi
 TARGET = win_optimizer.exe
 
 # For MSVC: cl win_optimizer.c /Fe:win_optimizer.exe shell32.lib advapi32.lib /link /MANIFESTUAC:"level='requireAdministrator'"
