@@ -4,15 +4,13 @@
  * Run as Administrator for full functionality.
  *
  * Optimizations performed:
- * - Empty Standby Memory List (frees cached RAM when memory pressure exists)
  * - Clear temp files (TEMP, TMP, Windows\Temp)
  * - Empty Recycle Bin
  * - Flush DNS cache
  * - Restart Windows Explorer (fixes sluggish desktop/taskbar)
  * - Optimize screen/display (flush graphics, redraw desktop, restart DWM when lagging)
- * - Flush modified memory list, purge low-priority standby (low-level NT memory)
  * - Flush filesystem cache (volume C:), clear clipboard
- * - Trim working sets of background processes, boost process priority
+ * - Boost process priority, trim current process working set
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -28,54 +26,9 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
-#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Undocumented NT API for memory optimization */
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#define STATUS_PRIVILEGE_NOT_HELD ((NTSTATUS)0xC0000061L)
-
-typedef long NTSTATUS;
-
-typedef enum _SYSTEM_INFORMATION_CLASS {
-    SystemMemoryListInformation = 80
-} SYSTEM_INFORMATION_CLASS;
-
-typedef enum _SYSTEM_MEMORY_LIST_COMMAND {
-    MemoryCaptureAccessedBits,
-    MemoryCaptureAndResetAccessedBits,
-    MemoryEmptyWorkingSets,
-    MemoryFlushModifiedList,
-    MemoryPurgeStandbyList,
-    MemoryPurgeLowPriorityStandbyList,
-    MemoryCommandMax
-} SYSTEM_MEMORY_LIST_COMMAND;
-
-typedef NTSTATUS(WINAPI* pNtSetSystemInformation)(INT, PVOID, ULONG);
-
-/* Enable a privilege for the current process token */
-static BOOL EnablePrivilege(HANDLE hToken, LPCSTR lpName) {
-    LUID luid;
-    TOKEN_PRIVILEGES tp;
-    TOKEN_PRIVILEGES tpPrevious;
-    DWORD cbPrevious = sizeof(TOKEN_PRIVILEGES);
-
-    if (!LookupPrivilegeValueA(NULL, lpName, &luid)) {
-        return FALSE;
-    }
-
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES),
-                               &tpPrevious, &cbPrevious)) {
-        return FALSE;
-    }
-    return (GetLastError() == ERROR_SUCCESS);
-}
 
 /* Result buffer for confirmation message (shared) */
 #define RESULT_BUF_SIZE 2048
@@ -89,80 +42,6 @@ static void AppendResult(const WCHAR* text) {
         if (curLen > 0) wcscat(g_resultBuf, L"\n");
         wcscat(g_resultBuf, text);
     }
-}
-
-/* Empty the Windows Standby Memory List - frees cached RAM, flush modified pages */
-static int EmptyStandbyList(void) {
-    HANDLE hProcess = GetCurrentProcess();
-    HANDLE hToken = NULL;
-    HMODULE hNtdll;
-    pNtSetSystemInformation NtSetSystemInformation = NULL;
-    NTSTATUS status;
-    SYSTEM_MEMORY_LIST_COMMAND cmd;
-    int anyOk = 0;
-
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken)) {
-        fprintf(stderr, "[!] Cannot open process token (run as Administrator)\n");
-        return -1;
-    }
-
-    if (!EnablePrivilege(hToken, "SeProfileSingleProcessPrivilege")) {
-        fprintf(stderr, "[!] Cannot enable SeProfileSingleProcessPrivilege\n");
-        CloseHandle(hToken);
-        return -1;
-    }
-    CloseHandle(hToken);
-
-    hNtdll = LoadLibraryW(L"ntdll.dll");
-    if (!hNtdll) {
-        fprintf(stderr, "[!] Cannot load ntdll.dll\n");
-        return -1;
-    }
-
-    NtSetSystemInformation = (pNtSetSystemInformation)(void*)GetProcAddress(hNtdll, "NtSetSystemInformation");
-    if (!NtSetSystemInformation) {
-        fprintf(stderr, "[!] Cannot get NtSetSystemInformation address\n");
-        FreeLibrary(hNtdll);
-        return -1;
-    }
-
-    /* Purge low-priority standby first (less aggressive) */
-    cmd = MemoryPurgeLowPriorityStandbyList;
-    status = NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(cmd));
-    if (NT_SUCCESS(status)) {
-        printf("[+] Low-priority standby purged\n");
-        AppendResult(L"• Low-priority standby purged");
-        anyOk = 1;
-    } else if (status != STATUS_PRIVILEGE_NOT_HELD) {
-        fprintf(stderr, "[!] Purge low-priority standby failed: 0x%08lX\n", (unsigned long)status);
-    }
-
-    /* Flush modified (dirty) pages to disk */
-    cmd = MemoryFlushModifiedList;
-    status = NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(cmd));
-    if (NT_SUCCESS(status)) {
-        printf("[+] Modified memory list flushed to disk\n");
-        AppendResult(L"• Modified list flushed to disk");
-        anyOk = 1;
-    } else if (status != STATUS_PRIVILEGE_NOT_HELD) {
-        fprintf(stderr, "[!] Flush modified list failed: 0x%08lX\n", (unsigned long)status);
-    }
-
-    /* Full standby list purge */
-    cmd = MemoryPurgeStandbyList;
-    status = NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(cmd));
-    if (NT_SUCCESS(status)) {
-        printf("[+] Standby memory list emptied - RAM freed\n");
-        AppendResult(L"• Standby memory emptied - RAM freed");
-        anyOk = 1;
-    } else if (status == STATUS_PRIVILEGE_NOT_HELD) {
-        fprintf(stderr, "[!] Insufficient privileges - run as Administrator\n");
-    } else {
-        fprintf(stderr, "[!] Purge standby list failed: 0x%08lX\n", (unsigned long)status);
-    }
-
-    FreeLibrary(hNtdll);
-    return anyOk ? 0 : -1;
 }
 
 /* Delete all files in a directory (non-recursive) */
@@ -447,56 +326,6 @@ static int FlushSystemVolume(void) {
     return -1;
 }
 
-/* Trim working sets of background processes - frees RAM from idle processes (needs Admin) */
-static int TrimBackgroundProcesses(void) {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    HANDLE hProc;
-    PROCESSENTRY32W pe = { 0 };
-    int trimmed = 0;
-    static const WCHAR* skipList[] = {
-        L"System", L"Registry", L"smss.exe", L"csrss.exe", L"wininit.exe",
-        L"services.exe", L"lsass.exe", L"svchost.exe", L"winlogon.exe",
-        L"dwm.exe", L"explorer.exe", NULL
-    };
-
-    if (hSnap == INVALID_HANDLE_VALUE) return -1;
-
-    pe.dwSize = sizeof(pe);
-    if (!Process32FirstW(hSnap, &pe)) {
-        CloseHandle(hSnap);
-        return -1;
-    }
-
-    do {
-        int skip = 0;
-        for (int s = 0; skipList[s]; s++) {
-            if (_wcsicmp(pe.szExeFile, skipList[s]) == 0) {
-                skip = 1;
-                break;
-            }
-        }
-        if (skip || pe.th32ProcessID == GetCurrentProcessId()) continue;
-
-        hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION, FALSE, pe.th32ProcessID);
-        if (hProc) {
-            if (EmptyWorkingSet(hProc)) {
-                trimmed++;
-            }
-            CloseHandle(hProc);
-        }
-    } while (Process32NextW(hSnap, &pe));
-
-    CloseHandle(hSnap);
-    if (trimmed > 0) {
-        printf("[+] Trimmed working sets of %d background processes\n", trimmed);
-        WCHAR buf[64];
-        swprintf(buf, 64, L"• Trimmed %d background process working sets", trimmed);
-        AppendResult(buf);
-        return 0;
-    }
-    return -1;
-}
-
 /* Trim working set of current process - minor optimization */
 static void TrimWorkingSet(void) {
     if (SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1)) {
@@ -510,7 +339,6 @@ static void PrintUsage(const char* prog) {
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
     printf("  (none)     Run all optimizations\n");
-    printf("  /memory    Empty standby memory list only (needs Admin)\n");
     printf("  /temp      Clear temp files only\n");
     printf("  /recycle   Empty Recycle Bin only\n");
     printf("  /dns       Flush DNS cache only\n");
@@ -523,7 +351,7 @@ static void PrintUsage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     (void)argv;
-    int doMemory = 1, doTemp = 1, doRecycle = 1, doDns = 1, doExplorer = 1, doScreen = 1;
+    int doTemp = 1, doRecycle = 1, doDns = 1, doExplorer = 1, doScreen = 1;
     BOOL doDwmRestart = TRUE;
     int i;
     LPWSTR* argvW;
@@ -540,23 +368,20 @@ int main(int argc, char* argv[]) {
             PrintUsage("win_optimizer");
             return 0;
         }
-        if (arg && _wcsicmp(arg, L"/memory") == 0) {
-            doMemory = 1; doTemp = 0; doRecycle = 0; doDns = 0; doExplorer = 0; doScreen = 0;
-        }
-        else if (arg && _wcsicmp(arg, L"/temp") == 0) {
-            doMemory = 0; doTemp = 1; doRecycle = 0; doDns = 0; doExplorer = 0; doScreen = 0;
+        if (arg && _wcsicmp(arg, L"/temp") == 0) {
+            doTemp = 1; doRecycle = 0; doDns = 0; doExplorer = 0; doScreen = 0;
         }
         else if (arg && _wcsicmp(arg, L"/recycle") == 0) {
-            doMemory = 0; doTemp = 0; doRecycle = 1; doDns = 0; doExplorer = 0; doScreen = 0;
+            doTemp = 0; doRecycle = 1; doDns = 0; doExplorer = 0; doScreen = 0;
         }
         else if (arg && _wcsicmp(arg, L"/dns") == 0) {
-            doMemory = 0; doTemp = 0; doRecycle = 0; doDns = 1; doExplorer = 0; doScreen = 0;
+            doTemp = 0; doRecycle = 0; doDns = 1; doExplorer = 0; doScreen = 0;
         }
         else if (arg && _wcsicmp(arg, L"/explorer") == 0) {
-            doMemory = 0; doTemp = 0; doRecycle = 0; doDns = 0; doExplorer = 1; doScreen = 0;
+            doTemp = 0; doRecycle = 0; doDns = 0; doExplorer = 1; doScreen = 0;
         }
         else if (arg && _wcsicmp(arg, L"/screen") == 0) {
-            doMemory = 0; doTemp = 0; doRecycle = 0; doDns = 0; doExplorer = 0; doScreen = 1;
+            doTemp = 0; doRecycle = 0; doDns = 0; doExplorer = 0; doScreen = 1;
         }
         else if (arg && _wcsicmp(arg, L"/quick") == 0) {
             doExplorer = 0;
@@ -577,7 +402,6 @@ int main(int argc, char* argv[]) {
             AppendResult(L"• Process priority boosted");
         }
 
-    if (doMemory) EmptyStandbyList();
     if (doTemp) ClearTempFiles();
     if (doRecycle) EmptyRecycleBin();
     if (doDns) FlushDnsCache();
@@ -586,7 +410,6 @@ int main(int argc, char* argv[]) {
 
     ClearClipboard();
     FlushSystemVolume();
-    TrimBackgroundProcesses();
     TrimWorkingSet();
 
     /* Restore process priority */
